@@ -1,0 +1,65 @@
+def filter_html(html: str) -> str:
+    soup = BeautifulSoup(html, "html.parser")
+
+    title = soup.title.get_text(strip=True) if soup.title else ""
+    h1 = soup.find("h1")
+    h1_text = normalize_ws(h1.get_text(" ", strip=True)) if h1 else ""
+
+    if h1:
+        iterable = h1.find_all_next(True)
+    else:
+        body = soup.body or soup
+        iterable = body.find_all(True)
+
+    content_lines = []
+
+    # If no <h1>, try to pick a heading-like element right before the first <pre>
+    if not h1:
+        pre = soup.find("pre")
+        if pre:
+            for prev in pre.find_all_previous(True):
+                if prev.name in ("span", "div", "p", "b", "strong", "h2", "h3"):
+                    txt = normalize_ws(prev.get_text(" ", strip=True))
+                    if txt:
+                        content_lines.append(txt)
+                        break
+
+    for el in iterable:
+        # 🚨 skip anything that is still inside the <h1>
+        if h1 and h1 in el.parents:
+            continue
+
+        name = (el.name or "").lower()
+        txt = ""
+
+        if name in ("h2", "h3", "h4", "h5", "h6", "p", "li", "th"):
+            txt = normalize_ws(el.get_text(" ", strip=True))
+
+        elif name in ("b", "strong"):
+            if not el.find_parent(["p", "li"]):
+                txt = normalize_ws(el.get_text(" ", strip=True))
+
+        elif name == "a":
+            if is_block_anchor(el):
+                txt = normalize_ws(el.get_text(" ", strip=True))
+
+        elif name == "pre":
+            txt = el.get_text()
+
+        elif name == "td":
+            if el.find("b") or el.find("strong"):
+                txt = normalize_ws(el.get_text(" ", strip=True))
+
+        if txt and (not content_lines or content_lines[-1] != txt):
+            content_lines.append(txt)
+
+    parts = []
+    if title:
+        parts.append(f"title:{title}")
+    if h1_text:
+        parts.append(h1_text)
+    if content_lines:
+        parts.append("")
+        parts.extend(content_lines)
+
+    return "\n".join(parts)
