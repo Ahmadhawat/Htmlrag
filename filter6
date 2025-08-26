@@ -1,0 +1,106 @@
+# filter_html.py
+from bs4 import BeautifulSoup
+import argparse, sys, re
+from pathlib import Path
+
+def normalize_ws(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+def is_block_heading_anchor(a_tag) -> bool:
+    """Heuristic: <a> that is the only meaningful child in a block container."""
+    if not a_tag or not a_tag.get_text(strip=True):
+        return False
+    parent = a_tag.parent
+    if parent and parent.name in ("div", "td", "th"):
+        # only child or only with whitespace
+        siblings = [c for c in parent.children if getattr(c, "name", None) or str(c).strip()]
+        return len(siblings) == 1
+    return False
+
+def filter_html(html: str) -> str:
+    soup = BeautifulSoup(html, "html.parser")
+
+    title = soup.title.get_text(strip=True) if soup.title else ""
+
+    h1 = soup.find("h1")
+    h1_text = normalize_ws(h1.get_text(" ", strip=True)) if h1 else ""
+
+    # pick traversal root
+    if h1:
+        iterable = h1.find_all_next(True)
+    else:
+        body = soup.body or soup
+        iterable = body.find_all(True)
+
+    lines = []
+
+    # If no <h1>, try to grab a heading immediately before first <pre>
+    if not h1:
+        pre = soup.find("pre")
+        if pre:
+            for prev in pre.find_all_previous():
+                if prev.name in ("h2", "h3", "h4", "h5", "h6", "div", "td", "th", "p", "b", "strong", "span"):
+                    t = normalize_ws(prev.get_text(" ", strip=True))
+                    if t:
+                        lines.append(t)
+                        break
+
+    for el in iterable:
+        name = (el.name or "").lower()
+
+        # Headings h1..h6
+        if name in ("h1", "h2", "h3", "h4", "h5", "h6"):
+            txt = normalize_ws(el.get_text(" ", strip=True))
+
+        # Standalone bold/strong blocks (not inside paragraphs/lis)
+        elif name in ("b", "strong"):
+            if el.find_parent(["p", "li"]):
+                continue
+            txt = normalize_ws(el.get_text(" ", strip=True))
+
+        # Block-level anchor headings (e.g., <div><a>Koordinatensysteme</a></div>)
+        elif name == "a" and is_block_heading_anchor(el):
+            txt = normalize_ws(el.get_text(" ", strip=True))
+
+        # Normal content
+        elif name in ("p", "li"):
+            txt = normalize_ws(el.get_text(" ", strip=True))
+
+        # Preserve formatted blocks
+        elif name == "pre":
+            txt = el.get_text()  # keep line breaks/spaces
+
+        else:
+            continue
+
+        if txt and (not lines or lines[-1] != txt):
+            lines.append(txt)
+
+    # assemble output
+    out = []
+    if title:
+        out.append(f"title:{title}")
+    if h1_text:
+        out.append(h1_text)
+    if lines:
+        out.append("")
+        out.extend(lines)
+
+    return "\n".join(out)
+
+def main():
+    ap = argparse.ArgumentParser(description="Filter an HTML/HTM file to plain text.")
+    ap.add_argument("input")
+    ap.add_argument("-o", "--output")
+    args = ap.parse_args()
+
+    html = Path(args.input).read_text(encoding="utf-8", errors="ignore")
+    result = filter_html(html)
+
+    if args.output:
+        Path(args.output).write_text(result + "\n", encoding="utf-8")
+    else:
+        sys.stdout.write(result + "\n")
+
+if __name__ == "__main__":
+    main()
