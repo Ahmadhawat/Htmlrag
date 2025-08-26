@@ -1,0 +1,78 @@
+# filter_html.py
+from bs4 import BeautifulSoup
+import argparse
+import sys
+import re
+from pathlib import Path
+
+def normalize_ws(text: str) -> str:
+    """Collapse whitespace for normal text."""
+    return re.sub(r"\s+", " ", text).strip()
+
+def filter_html(html: str) -> str:
+    soup = BeautifulSoup(html, "html.parser")
+
+    # --- title ---
+    title = soup.title.get_text(strip=True) if soup.title else ""
+
+    # --- first H1 ---
+    h1_text = ""
+    h1 = soup.find("h1")
+    if h1:
+        h1_text = normalize_ws(h1.get_text(" ", strip=True))
+
+    # --- collect content after first H1 (if present, else whole body) ---
+    content_lines = []
+    start_point = h1 if h1 else soup.body
+
+    if start_point:
+        for el in start_point.find_all_next(True):
+            name = el.name.lower()
+
+            if name in ("p", "li"):
+                txt = normalize_ws(el.get_text(" ", strip=True))
+
+            elif name in ("b", "strong"):
+                if el.find_parent(["p", "li"]):
+                    continue
+                txt = normalize_ws(el.get_text(" ", strip=True))
+
+            elif name == "pre":
+                # preserve formatting exactly
+                txt = el.get_text()
+
+            else:
+                continue
+
+            if txt:
+                if not content_lines or content_lines[-1] != txt:
+                    content_lines.append(txt)
+
+    # --- assemble output ---
+    parts = []
+    if title:
+        parts.append(f"title:{title}")
+    if h1_text:
+        parts.append(h1_text)
+    if content_lines:
+        parts.append("")
+        parts.extend(content_lines)
+
+    return "\n".join(parts)
+
+def main():
+    ap = argparse.ArgumentParser(description="Filter an HTML/HTM file to plain text.")
+    ap.add_argument("input", help="Path to the HTML file")
+    ap.add_argument("-o", "--output", help="Path to save filtered text (default: stdout)")
+    args = ap.parse_args()
+
+    html = Path(args.input).read_text(encoding="utf-8", errors="ignore")
+    result = filter_html(html)
+
+    if args.output:
+        Path(args.output).write_text(result + "\n", encoding="utf-8")
+    else:
+        sys.stdout.write(result + "\n")
+
+if __name__ == "__main__":
+    main()
