@@ -1,0 +1,73 @@
+# filter_html.py
+from bs4 import BeautifulSoup
+import argparse
+import sys
+import re
+from pathlib import Path
+
+def normalize_ws(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+def filter_html(html: str) -> str:
+    soup = BeautifulSoup(html, "html.parser")
+
+    # --- title ---
+    title = soup.title.get_text(strip=True) if soup.title else ""
+
+    # --- first H1 (handles custom tags nested inside, e.g., madcap:conditionaltext) ---
+    h1_text = ""
+    h1 = soup.find("h1")
+    if h1:
+        h1_text = normalize_ws(h1.get_text(" ", strip=True))
+
+    # --- collect content AFTER the first H1 to avoid nav/menus ---
+    content_lines = []
+    if h1:
+        for el in h1.find_all_next(True):
+            name = el.name.lower()
+
+            # Only take block-ish content
+            if name in ("p", "li"):
+                txt = normalize_ws(el.get_text(" ", strip=True))
+            elif name in ("b", "strong"):
+                # allow standalone emphasized blocks like <div><b>HINWEIS</b></div>
+                # but skip when this <b>/<strong> is inside a paragraph/list item
+                if el.find_parent(["p", "li"]):
+                    continue
+                txt = normalize_ws(el.get_text(" ", strip=True))
+            else:
+                continue
+
+            if txt:
+                # avoid immediate duplicates
+                if not content_lines or content_lines[-1] != txt:
+                    content_lines.append(txt)
+
+    # --- assemble output ---
+    parts = []
+    if title:
+        parts.append(f"title:{title}")
+    if h1_text:
+        parts.append(h1_text)
+    if content_lines:
+        parts.append("")  # blank line between header and body
+        parts.extend(content_lines)
+
+    return "\n".join(parts)
+
+def main():
+    ap = argparse.ArgumentParser(description="Filter an HTML file to plain text.")
+    ap.add_argument("input", help="Path to the HTML/HTM file")
+    ap.add_argument("-o", "--output", help="Path to write the filtered text (default: stdout)")
+    args = ap.parse_args()
+
+    html = Path(args.input).read_text(encoding="utf-8", errors="ignore")
+    result = filter_html(html)
+
+    if args.output:
+        Path(args.output).write_text(result + "\n", encoding="utf-8")
+    else:
+        sys.stdout.write(result + "\n")
+
+if __name__ == "__main__":
+    main()
