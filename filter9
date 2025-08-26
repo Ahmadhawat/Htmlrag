@@ -1,0 +1,132 @@
+# filter_html.py
+from bs4 import BeautifulSoup
+import argparse
+import sys
+import re
+from pathlib import Path
+
+
+def normalize_ws(text: str) -> str:
+    """Collapse whitespace and strip."""
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def is_block_anchor(a_tag) -> bool:
+    """
+    Treat <a> as a headline only if it stands alone (not inline in text)
+    and not inside any heading.
+    """
+    # inline anchors or anchors within headings are not standalone
+    if a_tag.find_parent(["p", "li", "h1", "h2", "h3", "h4", "h5", "h6"]):
+        return False
+
+    parent = a_tag.parent
+    if not parent:
+        return True
+
+    # If the parent's visible text equals the <a>'s text, it stands alone.
+    parent_txt = normalize_ws(parent.get_text(" ", strip=True))
+    anchor_txt = normalize_ws(a_tag.get_text(" ", strip=True))
+    return parent_txt == anchor_txt
+
+
+def filter_html(html: str) -> str:
+    soup = BeautifulSoup(html, "html.parser")
+
+    title = soup.title.get_text(strip=True) if soup.title else ""
+
+    h1 = soup.find("h1")
+    h1_text = normalize_ws(h1.get_text(" ", strip=True)) if h1 else ""
+
+    # Traverse only AFTER the first <h1> (siblings, not descendants)
+    if h1:
+        iterable = h1.find_next_siblings(True)
+    else:
+        body = soup.body or soup
+        iterable = body.find_all(True)
+
+    content_lines = []
+
+    # If no <h1>, try to pick a heading-like element right before the first <pre>
+    if not h1:
+        pre = soup.find("pre")
+        if pre:
+            for prev in pre.find_all_previous(True):
+                if prev.name in ("span", "div", "p", "b", "strong", "h2", "h3"):
+                    txt = normalize_ws(prev.get_text(" ", strip=True))
+                    if txt:
+                        content_lines.append(txt)
+                        break
+
+    for el in iterable:
+        name = (el.name or "").lower()
+        txt = ""
+
+        if name in ("h2", "h3", "h4", "h5", "h6"):
+            txt = normalize_ws(el.get_text(" ", strip=True))
+
+        elif name in ("p", "li"):
+            txt = normalize_ws(el.get_text(" ", strip=True))
+
+        elif name in ("b", "strong"):
+            # keep only if not inline inside p/li
+            if el.find_parent(["p", "li"]):
+                txt = ""
+            else:
+                txt = normalize_ws(el.get_text(" ", strip=True))
+
+        elif name == "a":
+            if is_block_anchor(el):
+                txt = normalize_ws(el.get_text(" ", strip=True))
+            else:
+                txt = ""
+
+        elif name == "pre":
+            # preserve monospace formatting exactly
+            txt = el.get_text()
+
+        elif name == "th":
+            txt = normalize_ws(el.get_text(" ", strip=True))
+
+        elif name == "td":
+            # capture table cells that start with bold (section captions)
+            if el.find("b") or el.find("strong"):
+                txt = normalize_ws(el.get_text(" ", strip=True))
+            else:
+                txt = ""
+        else:
+            txt = ""
+
+        # Avoid immediate duplicates
+        if txt and (not content_lines or content_lines[-1] != txt):
+            content_lines.append(txt)
+
+    parts = []
+    if title:
+        parts.append(f"title:{title}")
+    if h1_text:
+        parts.append(h1_text)
+    if content_lines:
+        parts.append("")
+        parts.extend(content_lines)
+
+    return "\n".join(parts)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Filter an HTML/HTM file to plain text.")
+    ap.add_argument("input")
+    ap.add_argument("-o", "--output")
+    args = ap.parse_args()
+
+    html = Path(args.input).read_text(encoding="utf-8", errors="ignore")
+    result = filter_html(html)
+
+    if args.output:
+        Path(args.output).write_text(result + "\n", encoding="utf-8")
+    else:
+        sys.stdout.write(result + "\n")
+
+
+if __name__ == "__main__":
+    main()
