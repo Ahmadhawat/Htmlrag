@@ -1,0 +1,152 @@
+# filter_html.py
+from bs4 import BeautifulSoup
+import argparse, sys, re
+from pathlib import Path
+
+NB_START = "§§NBSTART§§"
+NB_END = "§§NBEND§§"
+
+def normalize_ws(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+def is_block_heading_anchor(a_tag) -> bool:
+    if not a_tag or not a_tag.get_text(strip=True):
+        return False
+    parent = a_tag.parent
+    if parent and parent.name in ("div", "td", "th"):
+        siblings = [c for c in parent.children if getattr(c, "name", None) or str(c).strip()]
+        return len(siblings) == 1
+    return False
+
+def list_block_text(lst) -> str:
+    """Return a single block with one line per <li> item."""
+    lines = []
+    for li in lst.find_all("li", recursive=True):
+        t = normalize_ws(li.get_text(" ", strip=True))
+        if t:
+            lines.append(t)
+    return "\n".join(lines)
+
+def filter_html(html: str) -> str:
+    soup = BeautifulSoup(html, "html.parser")
+
+    title = soup.title.get_text(strip=True) if soup.title else ""
+    h1 = soup.find("h1")
+    h1_text = normalize_ws(h1.get_text(" ", strip=True)) if h1 else ""
+
+    # Traversal root
+    if h1:
+        iterable = h1.find_all_next(True)
+    else:
+        body = soup.body or soup
+        iterable = body.find_all(True)
+
+    out_lines = []
+
+    # If no <h1>, try to grab a heading immediately before first <pre>
+    if not h1:
+        pre = soup.find("pre")
+        if pre:
+            for prev in pre.find_all_previous():
+                if prev.name in ("h2","h3","h4","h5","h6","div","td","th","p","b","strong","span"):
+                    t = normalize_ws(prev.get_text(" ", strip=True))
+                    if t:
+                        out_lines.append(t)
+                        break
+
+    # Track elements we consume wholesale (e.g., UL/OL) to avoid double-processing children
+    consumed_ids = set()
+
+    for el in iterable:
+        if id(el) in consumed_ids:
+            continue
+
+        name = (el.name or "").lower()
+
+        # Headings
+        if name in ("h1","h2","h3","h4","h5","h6"):
+            txt = normalize_ws(el.get_text(" ", strip=True))
+            if txt and (not out_lines or out_lines[-1] != txt):
+                out_lines.append(txt)
+
+        # Standalone bold blocks
+        elif name in ("b","strong"):
+            if el.find_parent(["p","li"]):
+                continue
+            txt = normalize_ws(el.get_text(" ", strip=True))
+            if txt and (not out_lines or out_lines[-1] != txt):
+                out_lines.append(txt)
+
+        # Block-level anchor headings
+        elif name == "a" and is_block_heading_anchor(el):
+            txt = normalize_ws(el.get_text(" ", strip=True))
+            if txt and (not out_lines or out_lines[-1] != txt):
+                out_lines.append(txt)
+
+        # Lists: keep the whole list as a single no-break block
+        elif name in ("ul","ol"):
+            block = list_block_text(el)
+            if block:
+                out_lines.append(NB_START)
+                out_lines.append(block)
+                out_lines.append(NB_END)
+                # mark children as consumed
+                for child in el.find_all(True, recursive=True):
+                    consumed_ids.add(id(child))
+
+        # Paragraphs
+        elif name == "p":
+            txt = normalize_ws(el.get_text(" ", strip=True))
+            if txt:
+                # Optional: if this paragraph is "Beispiel" and followed by a <pre>, group them
+                nxt = el.find_next_sibling()
+                if txt.lower().startswith("beispiel") and nxt and nxt.name == "pre":
+                    out_lines.append(NB_START)
+                    out_lines.append(txt)
+                    out_lines.append(nxt.get_text())  # keep <pre> verbatim
+                    out_lines.append(NB_END)
+                    consumed_ids.add(id(nxt))
+                else:
+                    if not out_lines or out_lines[-1] != txt:
+                        out_lines.append(txt)
+
+        # Preformatted blocks: keep verbatim and mark as no-break
+        elif name == "pre":
+            txt = el.get_text()
+            if txt:
+                out_lines.append(NB_START)
+                out_lines.append(txt)
+                out_lines.append(NB_END)
+
+        # else: ignore other tags
+        else:
+            continue
+
+    # Assemble output
+    final = []
+    if title:
+        final.append(f"title:{title}")
+    if h1_text:
+        final.append(h1_text)
+    if out_lines:
+        final.append("")
+        final.extend(out_lines)
+
+    return "\n".join(final)
+
+def main():
+    ap = argparse.ArgumentParser(description="Filter an HTML/HTM file to plain text with no-break markers.")
+    ap.add_argument("input")
+    ap.add_argument("-o","--output")
+    args = ap.parse_args()
+
+    html = Path(args.input).read_text(encoding="utf-8", errors="ignore")
+    result = filter_html(html)
+
+    if args.output:
+        Path(args.output).write_text(result + "\n", encoding="utf-8")
+    else:
+        sys.stdout.write(result + "\n")
+
+if __name__ == "__main__":
+    main()
