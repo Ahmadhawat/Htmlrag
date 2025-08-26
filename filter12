@@ -1,0 +1,119 @@
+# filter_html.py
+# Extracts readable text from help HTML/HTM:
+# - title
+# - <h1> (if present), also <h2>/<h3>/<h4>
+# - <p>, <li>
+# - standalone <b>/<strong> (not inside p/li)
+# - <pre> blocks (kept verbatim)
+# - bold labels inside table cells (<td>/<th><b>..</b>)
+# - links used as headings ONLY if they are the sole <a> in their parent (skip breadcrumbs)
+#
+# Traversal: after first <h1> to avoid menus; otherwise everything in <body>.
+
+from bs4 import BeautifulSoup
+import argparse, sys, re
+from pathlib import Path
+
+def normalize_ws(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+def extract_bold_from_cell(cell) -> str:
+    bolds = cell.find_all(["b", "strong"])
+    return " ".join(normalize_ws(b.get_text(" ", strip=True)) for b in bolds).strip()
+
+def is_solo_heading_link(a_tag) -> bool:
+    # keep only if the <a> is the ONLY direct <a> child of its parent (avoids breadcrumbs)
+    parent = a_tag.parent
+    if not parent:
+        return False
+    if a_tag.find_parent(["nav", "header", "footer"]):
+        return False
+    direct_links = [c for c in parent.find_all("a", recursive=False)]
+    return len(direct_links) == 1
+
+def filter_html(html: str) -> str:
+    soup = BeautifulSoup(html, "html.parser")
+
+    # --- title ---
+    title = soup.title.get_text(strip=True) if soup.title else ""
+
+    # --- first H1 (if any) ---
+    h1 = soup.find("h1")
+    h1_text = normalize_ws(h1.get_text(" ", strip=True)) if h1 else ""
+
+    # --- choose traversal root ---
+    if h1:
+        iterable = h1.find_all_next(True)           # after the first content heading
+    else:
+        body = soup.body or soup
+        iterable = body.find_all(True)              # everything inside <body>
+
+    content_lines = []
+
+    # If no <h1>, try to take a nearby heading before the first <pre> (common in reports)
+    if not h1:
+        pre = soup.find("pre")
+        if pre:
+            for prev in pre.find_all_previous():
+                if prev.name in ("span", "div", "p", "b", "strong", "h2", "h3", "h4"):
+                    t = normalize_ws(prev.get_text(" ", strip=True))
+                    if t:
+                        content_lines.append(t)
+                        break
+
+    # --- collect content ---
+    for el in iterable:
+        name = (el.name or "").lower()
+        txt = ""
+
+        if name in ("p", "li", "h2", "h3", "h4"):
+            txt = normalize_ws(el.get_text(" ", strip=True))
+
+        elif name in ("b", "strong"):
+            # keep only when not nested in p/li (used as headline blocks)
+            if not el.find_parent(["p", "li"]):
+                txt = normalize_ws(el.get_text(" ", strip=True))
+
+        elif name == "a":
+            if is_solo_heading_link(el):
+                txt = normalize_ws(el.get_text(" ", strip=True))
+
+        elif name == "pre":
+            # keep verbatim (ASCII tables / code)
+            txt = el.get_text()
+
+        elif name in ("td", "th"):
+            txt = extract_bold_from_cell(el)
+
+        # append if meaningful and not a direct duplicate of the previous line
+        if txt and (not content_lines or content_lines[-1] != txt):
+            content_lines.append(txt)
+
+    # --- assemble output ---
+    parts = []
+    if title:
+        parts.append(f"title:{title}")
+    if h1_text:
+        parts.append(h1_text)
+    if content_lines:
+        parts.append("")       # blank line before body
+        parts.extend(content_lines)
+
+    return "\n".join(parts)
+
+def main():
+    ap = argparse.ArgumentParser(description="Filter an HTML/HTM file to plain text.")
+    ap.add_argument("input", help="Path to the HTML/HTM file")
+    ap.add_argument("-o", "--output", help="Path to write the filtered text (default: stdout)")
+    args = ap.parse_args()
+
+    html = Path(args.input).read_text(encoding="utf-8", errors="ignore")
+    result = filter_html(html)
+
+    if args.output:
+        Path(args.output).write_text(result + "\n", encoding="utf-8")
+    else:
+        sys.stdout.write(result + "\n")
+
+if __name__ == "__main__":
+    main()
