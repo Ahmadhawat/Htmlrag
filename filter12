@@ -1,14 +1,12 @@
 # filter_html.py
-# Extracts readable text from help HTML/HTM:
+# Extracts clean text from HTML/HTM files:
 # - title
-# - <h1> (if present), also <h2>/<h3>/<h4>
+# - <h1> (if present) and also <h2>/<h3>/<h4>
 # - <p>, <li>
-# - standalone <b>/<strong> (not inside p/li)
-# - <pre> blocks (kept verbatim)
-# - bold labels inside table cells (<td>/<th><b>..</b>)
-# - links used as headings ONLY if they are the sole <a> in their parent (skip breadcrumbs)
-#
-# Traversal: after first <h1> to avoid menus; otherwise everything in <body>.
+# - standalone <b>/<strong> blocks (not inside p/li)
+# - <pre> blocks preserved verbatim (ASCII tables, code)
+# - bold labels inside table cells (<td>/<th><b>…</b>)
+# - <a> kept ONLY if it's the sole <a> in its parent (avoids breadcrumbs)
 
 from bs4 import BeautifulSoup
 import argparse, sys, re
@@ -20,16 +18,6 @@ def normalize_ws(text: str) -> str:
 def extract_bold_from_cell(cell) -> str:
     bolds = cell.find_all(["b", "strong"])
     return " ".join(normalize_ws(b.get_text(" ", strip=True)) for b in bolds).strip()
-
-def is_solo_heading_link(a_tag) -> bool:
-    # keep only if the <a> is the ONLY direct <a> child of its parent (avoids breadcrumbs)
-    parent = a_tag.parent
-    if not parent:
-        return False
-    if a_tag.find_parent(["nav", "header", "footer"]):
-        return False
-    direct_links = [c for c in parent.find_all("a", recursive=False)]
-    return len(direct_links) == 1
 
 def filter_html(html: str) -> str:
     soup = BeautifulSoup(html, "html.parser")
@@ -43,14 +31,14 @@ def filter_html(html: str) -> str:
 
     # --- choose traversal root ---
     if h1:
-        iterable = h1.find_all_next(True)           # after the first content heading
+        iterable = h1.find_all_next(True)          # start after first H1
     else:
         body = soup.body or soup
-        iterable = body.find_all(True)              # everything inside <body>
+        iterable = body.find_all(True)             # traverse whole body
 
     content_lines = []
 
-    # If no <h1>, try to take a nearby heading before the first <pre> (common in reports)
+    # If no <h1>, try a nearby heading before the first <pre>
     if not h1:
         pre = soup.find("pre")
         if pre:
@@ -70,22 +58,31 @@ def filter_html(html: str) -> str:
             txt = normalize_ws(el.get_text(" ", strip=True))
 
         elif name in ("b", "strong"):
-            # keep only when not nested in p/li (used as headline blocks)
+            # keep standalone emphasized blocks (not headings inside p/li)
             if not el.find_parent(["p", "li"]):
                 txt = normalize_ws(el.get_text(" ", strip=True))
 
         elif name == "a":
-            if is_solo_heading_link(el):
-                txt = normalize_ws(el.get_text(" ", strip=True))
+            # << requested rule >>
+            # only keep link text if it's the ONLY <a> child in its parent
+            parent = el.parent
+            if parent and not el.find_parent(["nav", "header", "footer"]):
+                siblings = [c for c in parent.find_all("a", recursive=False)]
+                if len(siblings) == 1:
+                    txt = normalize_ws(el.get_text(" ", strip=True))
+                else:
+                    txt = ""
+            else:
+                txt = ""
 
         elif name == "pre":
-            # keep verbatim (ASCII tables / code)
+            # preserve formatting exactly
             txt = el.get_text()
 
         elif name in ("td", "th"):
+            # extract bold labels from table cells
             txt = extract_bold_from_cell(el)
 
-        # append if meaningful and not a direct duplicate of the previous line
         if txt and (not content_lines or content_lines[-1] != txt):
             content_lines.append(txt)
 
@@ -96,7 +93,7 @@ def filter_html(html: str) -> str:
     if h1_text:
         parts.append(h1_text)
     if content_lines:
-        parts.append("")       # blank line before body
+        parts.append("")
         parts.extend(content_lines)
 
     return "\n".join(parts)
@@ -104,7 +101,7 @@ def filter_html(html: str) -> str:
 def main():
     ap = argparse.ArgumentParser(description="Filter an HTML/HTM file to plain text.")
     ap.add_argument("input", help="Path to the HTML/HTM file")
-    ap.add_argument("-o", "--output", help="Path to write the filtered text (default: stdout)")
+    ap.add_argument("-o", "--output", help="Path for the filtered text (default: stdout)")
     args = ap.parse_args()
 
     html = Path(args.input).read_text(encoding="utf-8", errors="ignore")
