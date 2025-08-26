@@ -1,0 +1,101 @@
+# filter_html.py
+from bs4 import BeautifulSoup
+import argparse, sys, re
+from pathlib import Path
+
+def normalize_ws(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+def extract_bold_from_cell(cell) -> str:
+    bolds = cell.find_all(["b", "strong"])
+    txt = " ".join(normalize_ws(b.get_text(" ", strip=True)) for b in bolds)
+    return txt.strip()
+
+def filter_html(html: str) -> str:
+    soup = BeautifulSoup(html, "html.parser")
+
+    title = soup.title.get_text(strip=True) if soup.title else ""
+
+    h1 = soup.find("h1")
+    h1_text = normalize_ws(h1.get_text(" ", strip=True)) if h1 else ""
+
+    # traverse after first <h1> if present; otherwise whole body
+    if h1:
+        iterable = h1.find_all_next(True)
+    else:
+        body = soup.body or soup
+        iterable = body.find_all(True)
+
+    content_lines = []
+
+    # If no <h1>, grab a nearby heading before the first <pre> (helps “DYNA…” pages)
+    if not h1:
+        pre = soup.find("pre")
+        if pre:
+            for prev in pre.find_all_previous():
+                if prev.name in ("span", "div", "p", "b", "strong", "h2", "h3"):
+                    txt = normalize_ws(prev.get_text(" ", strip=True))
+                    if txt:
+                        content_lines.append(txt)
+                        break
+
+    for el in iterable:
+        name = (el.name or "").lower()
+        txt = ""
+
+        if name in ("p", "li", "h2", "h3", "h4"):
+            txt = normalize_ws(el.get_text(" ", strip=True))
+
+        elif name in ("b", "strong"):
+            # keep standalone emphasized blocks (not inside p/li)
+            if el.find_parent(["p", "li"]):
+                txt = ""
+            else:
+                txt = normalize_ws(el.get_text(" ", strip=True))
+
+        elif name == "a":
+            # capture links used as headings, but skip nav/header/footer
+            if el.find_parent(["nav", "header", "footer"]):
+                txt = ""
+            else:
+                txt = normalize_ws(el.get_text(" ", strip=True))
+
+        elif name == "pre":
+            # preserve formatting exactly
+            txt = el.get_text()
+
+        elif name in ("td", "th"):
+            # only extract bold/strong content from table cells
+            txt = extract_bold_from_cell(el)
+
+        # record if non-empty and not a duplicate of the last line
+        if txt and (not content_lines or content_lines[-1] != txt):
+            content_lines.append(txt)
+
+    parts = []
+    if title:
+        parts.append(f"title:{title}")
+    if h1_text:
+        parts.append(h1_text)
+    if content_lines:
+        parts.append("")
+        parts.extend(content_lines)
+
+    return "\n".join(parts)
+
+def main():
+    ap = argparse.ArgumentParser(description="Filter an HTML/HTM file to plain text.")
+    ap.add_argument("input")
+    ap.add_argument("-o", "--output")
+    args = ap.parse_args()
+
+    html = Path(args.input).read_text(encoding="utf-8", errors="ignore")
+    result = filter_html(html)
+
+    if args.output:
+        Path(args.output).write_text(result + "\n", encoding="utf-8")
+    else:
+        sys.stdout.write(result + "\n")
+
+if __name__ == "__main__":
+    main()
