@@ -1,0 +1,68 @@
+# ---- Paths (all local, file-based) ----
+paths:
+  source_html: "/home/hawat/Downloads/sample_html_source"
+  workspace_htm: "./data/workspace/htm_files"
+  json_dir: "./data/workspace/json_files"
+  txt_dir: "./data/workspace/txt_files"
+  chunks_dir: "./data/workspace/chunking_files"
+  embeddings_dir: "./data/workspace/embedding_files"
+  vector_dataset_dir: "./data/workspace/vector_dataset"
+  lexical_index_dir: "./data/workspace/lexical_index"
+  hybrid_results_path: "./data/workspace/hybrid_results.json"
+
+# ---- Chunking (uses the embedder tokenizer; sentence-aware via spaCy) ----
+chunking:
+  max_total_tokens: 512     # total budget (will be capped to model.max_seq_length if smaller)
+  metadata_tokens: 60       # reserved for titles/ids; leaves ~452 for content
+  overlap_tokens: 96        # 80–100 is a good default
+  spacy_model: "de_core_news_md"
+
+# ---- Embeddings (local, retrieval-tuned model strongly recommended) ----
+embedding:
+  model_name: "intfloat/multilingual-e5-base"   # good German retrieval + long inputs
+  batch_size: 32
+  cache_folder: "./data/models/st"
+
+# If you stick with mpnet-style paraphrase models, reduce chunking to ~128–256 tokens.
+
+# ---- E5 Prefixes (OFF here; you can still enable in HybridSearch when you want) ----
+e5_prefixes:
+  use: false              # off in this config to keep things simple
+  query_prefix: "query: "
+  passage_prefix: "passage: "
+
+# ---- FAISS index/search settings ----
+faiss:
+  nlist: 100              # used only if n >= 10k (IVF)
+  nprobe: 48              # IVF search breadth at query time (increase for recall)
+
+# ---- Lexical (BM25) index settings ----
+lexical:
+  lemmatize: false        # QUICK WIN: off → doc/query use the same analyzer
+  spacy_model: "de_core_news_md"
+  min_chars: 2
+
+# ---- Query defaults (can also pass via artifacts["query_text"]) ----
+query:
+  text: ""                # you can put a default query here or set at runtime
+  k: 10                   # final top-K to return
+  k_vec: 30               # vector candidates
+  k_lex: 30               # lexical candidates
+
+# ---- Fusion config ----
+fusion:
+  method: "minmax"        # or "rrf" (tuning-free)
+  alpha: 0.5              # only used for minmax; raise if queries are fuzzy/natural, lower for keyword-heavy
+
+# ---- Pipeline order ----
+run:
+  steps:
+    - "preflight"
+    - "copy"
+    - "html_to_json"
+    - "json_to_txt"
+    - "chunk"            # map to ChunkWithEmbedderTokenizerStep
+    - "embed"            # map to EmbedWithControlsStep
+    - "index"            # your BuildFaissIndexStep
+    - "lexical_index"    # map to BuildLexicalIndexStep
+    # Then run "HybridSearch" for queries (separate invocation)

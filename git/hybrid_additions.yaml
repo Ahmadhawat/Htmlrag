@@ -1,0 +1,21 @@
+paths:
+  lexical_index_dir: "./data/workspace/lexical_index"
+  hybrid_results_path: "./data/workspace/hybrid_results.json"
+
+lexical:
+  lemmatize: false          # set false if you don't want spaCy
+  spacy_model: "de_core_news_md"
+  min_chars: 2
+
+query:
+  text: "Ihre Suchanfrage hier"
+  k: 10
+  k_vec: 30
+  k_lex: 30
+
+fusion:
+  method: "minmax"   # or "rrf"
+  alpha: 0.5         # only used for minmax
+
+faiss:
+  nprobe: 48         # only matters if your index is IVF
