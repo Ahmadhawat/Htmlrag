@@ -158,3 +158,44 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+You’re (silently) filtering that anchor because of this line in is_block_heading_anchor():
+
+return parent_txt == link_txt and only_inline_children(parent)
+
+only_inline_children(parent) returns False if the container has any child that’s not in INLINE_TAGS.
+Your <div><a>Mathematische Funktionen</a></div> likely has an extra inline-but-not-listed node (very often a <br> or an <img> added by the exporter). Since "br" and "img" aren’t in INLINE_TAGS, the check fails, so the block-anchor is never treated as a heading.
+
+Two easy fixes (pick one):
+
+A) Whitelist the missing inline tags
+
+Add br (and usually img) to INLINE_TAGS.
+
+INLINE_TAGS = {
+    "a","b","strong","i","em","span","code","kbd","samp","u","small",
+    "sup","sub","mark","br","img"  # ← add these
+}
+
+B) Loosen the heading test
+
+If the container’s visible text equals the link’s text, that’s already a strong signal. You can drop the only_inline_children(parent) requirement:
+
+def is_block_heading_anchor(a_tag) -> bool:
+    if not a_tag or not a_tag.get_text(strip=True):
+        return False
+    cont = a_tag
+    if cont.parent and getattr(cont.parent, "name", "").lower() in INLINE_TAGS:
+        cont = cont.parent
+    parent = cont.parent
+    if not parent or getattr(parent, "name", "").lower() not in {"div","td","th"}:
+        return False
+    parent_txt = normalize_ws(parent.get_text(" ", strip=True))
+    link_txt = normalize_ws(a_tag.get_text(" ", strip=True))
+    # treat as heading when the container text is basically just the link text
+    return bool(parent_txt) and parent_txt == link_txt
+
+Either change will make the “Mathematische Funktionen” line appear. If your pages come from varied sources, I’d do both: broaden INLINE_TAGS and relax the test.
+
