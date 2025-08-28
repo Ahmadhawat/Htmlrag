@@ -1,0 +1,175 @@
+Here’s a **clear documentation** you can drop in as `README_HYBRID.md` (or similar) to explain your whole setup.
+
+---
+
+# Hybrid Retrieval Pipeline (Local, No External DB)
+
+This project implements a **local Retrieval-Augmented Generation (RAG) retrieval layer** with **hybrid search** (semantic vectors + BM25 lexical search).
+All processing (chunking, embedding, indexing, querying) happens **locally** – no cloud calls, no external database.
+
+---
+
+## 📂 Pipeline Steps
+
+### 1. **Text Extraction**
+
+* Convert HTML → JSON → plain text (`.txt`) files.
+* Output: `paths.txt_dir` (all plain-text files).
+
+### 2. **Chunking**
+
+* Step: `ChunkWithEmbedderTokenizerStep` (`chunk_with_embedder_tokenizer.py`)
+* Splits documents into overlapping chunks of \~512 tokens.
+* Uses **spaCy** (`de_core_news_md`) for sentence boundaries.
+* Uses the **exact same tokenizer** as the embedding model to count tokens → prevents hidden truncation.
+* Configurable overlap (`chunking.overlap_tokens`) ensures continuity.
+
+Output: `paths.chunks_dir` with chunk `.txt` files.
+
+---
+
+### 3. **Embedding**
+
+* Step: `EmbedWithControlsStep` (`embed_with_controls.py`)
+* Loads a local **SentenceTransformers model** (recommended: `intfloat/multilingual-e5-base`).
+* Honors `max_seq_length` → avoids silent truncation.
+* Optional **E5 prefixes** (`passage:` for chunks, `query:` for queries) to boost retrieval quality.
+* Saves:
+
+  * `embeddings.npy` (matrix of \[n, d] float32 vectors)
+  * `embeddings.csv` (with `filename` + embeddings)
+
+Output: `paths.embeddings_dir`
+
+---
+
+### 4. **Vector Index**
+
+* Step: `BuildFaissIndexStep` (`index.py`)
+* Normalizes embeddings (L2) for cosine similarity using FAISS **inner product**.
+* Small corpora: `IndexFlatIP` (brute-force).
+* Large corpora: `IndexIVFFlat` (clustering + inverted lists).
+* Stores:
+
+  * `vector_index.faiss`
+  * `vector_metadata.json` (doc\_id → filename, plus index info)
+
+Output: `paths.vector_dataset_dir`
+
+---
+
+### 5. **Lexical Index**
+
+* Step: `BuildLexicalIndexStep` (`build_lexical_index.py`)
+* Uses **Whoosh** (BM25) to build an inverted index over chunks.
+* `doc_id` is aligned to FAISS row IDs → fusion is easy.
+* Config:
+
+  * `lexical.lemmatize: false` → doc/query processed identically by Whoosh’s analyzer (safe, quick win).
+  * If `true`, spaCy lemmatization is applied (but query preprocessing must match).
+
+Output: `paths.lexical_index_dir`
+
+---
+
+### 6. **Hybrid Search**
+
+* Step: `HybridSearchStep` (`hybrid_search.py`)
+* Query flow:
+
+  1. Embed query with same model (and optional `query:` prefix).
+  2. Search FAISS (vector results).
+  3. Search Whoosh (BM25 results).
+  4. Fuse scores (two methods):
+
+     * **minmax** (normalize scores, weighted average via `fusion.alpha`)
+     * **rrf** (Reciprocal Rank Fusion, tuning-free).
+* Metadata patch: works with both flat and nested `vector_metadata.json`.
+* Outputs:
+
+  * `hybrid_results.json` → list of top-K results with `doc_id`, `filename`, and scores.
+
+---
+
+## ⚙️ Config (`local.yaml`)
+
+```yaml
+paths:
+  txt_dir: ./data/workspace/txt_files
+  chunks_dir: ./data/workspace/chunking_files
+  embeddings_dir: ./data/workspace/embedding_files
+  vector_dataset_dir: ./data/workspace/vector_dataset
+  lexical_index_dir: ./data/workspace/lexical_index
+  hybrid_results_path: ./data/workspace/hybrid_results.json
+
+chunking:
+  max_total_tokens: 512
+  metadata_tokens: 60
+  overlap_tokens: 96
+  spacy_model: de_core_news_md
+
+embedding:
+  model_name: intfloat/multilingual-e5-base
+  batch_size: 32
+  cache_folder: ./data/models/st
+
+e5_prefixes:
+  use: false
+  query_prefix: "query: "
+  passage_prefix: "passage: "
+
+faiss:
+  nlist: 100
+  nprobe: 48
+
+lexical:
+  lemmatize: false
+  spacy_model: de_core_news_md
+  min_chars: 2
+
+query:
+  text: ""
+  k: 10
+  k_vec: 30
+  k_lex: 30
+
+fusion:
+  method: minmax
+  alpha: 0.5
+
+run:
+  steps: ["preflight","copy","html_to_json","json_to_txt",
+          "chunk","embed","index","lexical_index"]
+```
+
+---
+
+## 🔍 Validator Script
+
+Use `validate_hybrid.py` to test hybrid search:
+
+```bash
+python validate_hybrid.py \
+  --config config/local.yaml \
+  --queries "Kündigungsfrist" "Passwort ändern" \
+  --k 10 --show-snippet
+```
+
+Output: side-by-side **vector**, **lexical**, and **hybrid** scores.
+
+---
+
+## 📌 Key Lessons
+
+* Always **tokenize chunks with the same tokenizer** as your embedder → no silent truncation.
+* **Align doc\_id** across embeddings, FAISS, and BM25 for fusion.
+* Start with `lexical.lemmatize: false`. Later, if you want **lemma-aware BM25**, enable it and update query preprocessing.
+* Fusion:
+
+  * Use **minmax** with `alpha ≈ 0.5` if queries mix natural language + keywords.
+  * Use **rrf** if you want a tuning-free default.
+* Keep everything **local**: FAISS, Whoosh, spaCy, SentenceTransformers.
+
+---
+
+👉 Do you want me to also add a **step-by-step diagram** (ASCII or Markdown flowchart) to this doc to make the pipeline visually clear?

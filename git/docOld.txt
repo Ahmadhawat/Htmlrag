@@ -1,0 +1,209 @@
+Absolutely — here’s a clear, copy-pastable doc you can add as `README_OLD_ISSUES.md`. It explains what the **old pipeline** did, **why it failed**, and **how we fixed it**.
+
+---
+
+# Why the Old Retrieval Pipeline Under-performed (and How We Fixed It)
+
+This document explains what the **previous (old) pipeline** was doing and why its results were weak, especially on German text and longer passages. It also summarizes the fixes we implemented in the new hybrid pipeline.
+
+---
+
+## 1) What the old pipeline did
+
+1. **Chunking**
+
+   * Split text using **spaCy** sentences, but enforced chunk size using **tiktoken (`cl100k_base`)**.
+   * Targeted chunks around **512 tokens** (minus some metadata), with token **overlap**.
+
+2. **Embedding**
+
+   * Used a SentenceTransformers model (e.g., `paraphrase-multilingual-mpnet-base-v2` or `distiluse-*`).
+   * Encoded each chunk into a vector and saved `embeddings.npy` + `embeddings.csv`.
+
+3. **Vector index**
+
+   * Built a FAISS index:
+
+     * Normalized vectors to use **cosine** via **inner product (IP)**.
+     * Used **FlatIP** for small corpora; **IVFFlat** when `n ≥ 10k` vectors.
+   * Stored `vector_index.faiss` + a simple `doc_id → filename` map.
+
+4. **Querying**
+
+   * Vector-only retrieval (no lexical/BM25 branch).
+
+---
+
+## 2) Why the old pipeline gave poor results
+
+### A) Silent truncation: chunk tokens didn’t match the embedder’s tokenizer
+
+* **Chunking used `tiktoken`**, but the **embedder uses a different tokenizer**.
+* Many ST models truncate inputs around **128–256 tokens**. If you built \~512-token chunks with tiktoken, the embedder often saw **only the first \~128–256 tokens** → most of the chunk was **ignored**.
+* Result: embeddings did **not** represent the chunks; neighbors looked “random”.
+
+**Symptoms**
+
+* Top results had **low cosine (≈0.1–0.2)** on easy queries.
+* Retrieval missed very obvious paragraphs.
+* Re-embedding with shorter chunks suddenly improved results.
+
+### B) Model mismatch: paraphrase models vs. document retrieval
+
+* Models like `paraphrase-multilingual-mpnet-base-v2` are great for **STS / semantic similarity** of short texts, but they **underperform** long-chunk **retrieval** versus E5/BGE/GTE-style retrievers.
+* Combined with truncation, this amplified errors.
+
+**Symptoms**
+
+* Even after reducing chunk size, results were still meh—especially for domain/technical queries.
+
+### C) HTML → TXT noise contaminates chunks
+
+* If HTML extraction kept **navigation, footers, cookie banners, breadcrumbs**, or repeated blocks, chunks were noisy.
+* Noisy tokens degrade both vector and lexical signals.
+
+**Symptoms**
+
+* Hits were from boilerplate (e.g., “Datenschutz”, “Kontakt”) rather than the desired content.
+
+### D) IVF recall (if `n ≥ 10k`) not tuned at query time
+
+* FAISS **IVF** needs `nprobe` tuned at **query time**. Too small `nprobe` → **misses** the right lists → poor recall.
+
+**Symptoms**
+
+* Increasing `nprobe` from \~5 to \~32–64 immediately brought relevant neighbors.
+
+### E) No lexical fallback
+
+* Keyword-heavy queries (German **compounds**, product names, flags like `--dry-run`) need **BM25** to guarantee exact hits.
+* Vector-only retrieval couldn’t guarantee these.
+
+**Symptoms**
+
+* Queries with exact strings (IDs, acronyms) failed even though the strings existed.
+
+### F) (Sometimes) query/vector normalization mismatch
+
+* Database vectors were normalized; if **query vectors** weren’t normalized the same way, cosine/IP scores were skewed.
+
+**Symptoms**
+
+* Inconsistent similarities across queries; small code change (normalize query) improved stability.
+
+---
+
+## 3) What we changed (and why it works now)
+
+### ✅ Chunking fixed
+
+* New step **uses the embedder’s tokenizer** to count tokens, so chunk length never exceeds what the model really accepts.
+* Still sentence-aware via spaCy; token **overlap** preserved.
+* **Result**: no silent truncation; each vector represents its full chunk.
+
+### ✅ Embedding tightened
+
+* New embed step respects **`max_seq_length`**, supports **E5 prefixes** (`passage:` for corpus, `query:` for queries), and runs fully offline.
+* **Result**: higher-quality embeddings aligned for retrieval.
+
+### ✅ FAISS unchanged in principle, but used correctly
+
+* Still cosine via IP on **L2-normalized** vectors.
+* We reminded to set **`nprobe` ≈ 32–64** when IVF is used.
+* **Result**: better recall with IVF; stable scores.
+
+### ✅ Added a **BM25 lexical** index (Whoosh)
+
+* Indexed the **same chunks**; `doc_id` aligned to FAISS row id.
+* **`lexical.lemmatize: false`** for now (quick win; doc and query share the same analyzer).
+* **Result**: exact-term matching (compounds, IDs, flags) is guaranteed.
+
+### ✅ Hybrid fusion
+
+* Combined the **vector** and **lexical** lists with:
+
+  * **Min–max + α** (start at 0.5), or
+  * **RRF** (tuning-free).
+* **Result**: strong on both conceptual queries and exact keywords.
+
+### ✅ Metadata read fixed
+
+* `HybridSearch` now supports both **flat** and **nested** `vector_metadata.json` formats.
+* **Result**: filenames resolve correctly regardless of index writer variant.
+
+---
+
+## 4) Quick checklist to avoid regressions
+
+* **Chunking**
+
+  * Count tokens with the **embedder’s tokenizer**.
+  * Keep **content budget ≤ model.max\_seq\_length − metadata\_tokens**.
+  * Use **overlap** (80–100 tokens works well).
+
+* **Embedding**
+
+  * Prefer retrieval models for documents: **`intfloat/multilingual-e5-base`** or **BGE/GTE** multilingual.
+  * If using E5, enable prefixes: **`passage:`** for chunks, **`query:`** for queries.
+  * Keep embeddings as float32; normalize later for FAISS IP/cosine.
+
+* **FAISS**
+
+  * L2-normalize both **db** and **query** vectors.
+  * If IVF is active (n ≥ 10k), set **`nprobe` = 32–64** at query time.
+
+* **BM25**
+
+  * Keep `lexical.lemmatize: false` unless you also **lemmatize queries** to match.
+  * Strip boilerplate during HTML→TXT to reduce noise.
+
+* **Hybrid**
+
+  * Start with **minmax α = 0.5**; lower α for keyword-heavy domains, raise α for fuzzy NL queries.
+  * Or use **RRF** if you want no tuning.
+
+---
+
+## 5) Typical “bad behavior” and the fix that addresses it
+
+| Symptom                             | Root Cause                       | Fix                                                  |
+| ----------------------------------- | -------------------------------- | ---------------------------------------------------- |
+| Top results look random             | Chunk > model limit → truncation | Chunk with **embedder tokenizer**, cap to real limit |
+| Misses obvious exact terms          | Vector-only; no lexical          | Add **BM25** branch and fuse                         |
+| Good on fuzzy queries, bad on exact | Same as above                    | Lower **α** or use **RRF**                           |
+| Weak German performance             | Paraphrase model + truncation    | Use **E5/BGE/GTE**, align chunk size                 |
+| IVF misses good hits                | `nprobe` too low                 | Set **`nprobe` 32–64**                               |
+| Boilerplate dominates               | Noisy HTML→TXT                   | Strip menus/footers/cookie banners                   |
+
+---
+
+## 6) Minimal reproducible “sanity test”
+
+1. Pick 3 chunks with unique terms (IDs, product codes).
+2. Run the validator:
+
+   ```bash
+   python validate_hybrid.py \
+     --config config/local.yaml \
+     --queries "Kündigungsfrist" "Bestellnummer 123-XYZ" "Wie ändere ich mein Passwort?" \
+     --k 10 --show-snippet
+   ```
+3. Expect:
+
+   * **Lexical** should capture exact terms.
+   * **Vector** should capture paraphrases.
+   * **Hybrid** should show the best of both in the top-K.
+
+---
+
+## 7) Bottom line
+
+The old pipeline failed mainly because of **tokenizer mismatch + truncation** and **lack of a lexical fallback**.
+The new pipeline fixes that by:
+
+* aligning chunking to the **embedder’s tokenizer**,
+* using a **retrieval-tuned** model,
+* adding a local **BM25** index,
+* and **fusing** both signals.
+
+That’s why the new hybrid retrieval is much more reliable, especially for **German** and **\~512-token** chunks.
