@@ -173,3 +173,92 @@ Output: side-by-side **vector**, **lexical**, and **hybrid** scores.
 ---
 
 👉 Do you want me to also add a **step-by-step diagram** (ASCII or Markdown flowchart) to this doc to make the pipeline visually clear?
+Got it 👍 — you want your README_HYBRID.md updated so the beginning reflects your new HTML-to-Markdown cleaning (filter_html_md.py) and JSONL chunking (rag_pack.py) instead of the older html_to_json → json_to_txt → chunk_with_embedder_tokenizer.py flow.
+
+Here’s a rewritten introduction and pipeline section you can drop in, while keeping the rest of your documentation unchanged:
+
+
+---
+
+Hybrid Retrieval Pipeline (Local, No External DB)
+
+This project implements a local Retrieval-Augmented Generation (RAG) retrieval layer with hybrid search (semantic vectors + BM25 lexical search).
+All processing (HTML cleaning, chunking, embedding, indexing, querying) happens locally – no cloud calls, no external database.
+
+
+---
+
+📂 Pipeline Steps
+
+1. HTML Filtering → Markdown
+
+Script: filter_html_md.py
+
+Input: raw .htm / .html files
+
+Cleans boilerplate and extracts meaningful text
+
+Normalizes whitespace, preserves heading levels, handles special cases (tables, anchors, bold-as-heading).
+
+Output: Markdown (.md) with title: metadata and structured headings.
+
+
+
+---
+
+2. Packing & Chunking
+
+Script: rag_pack.py
+
+Input: filtered .md file
+
+Parses Markdown into sections (based on heading levels).
+
+Splits text into overlapping chunks using a regex tokenizer:
+
+Target: ~700 tokens
+
+Overlap: ~80 tokens
+
+Preserves <pre> code blocks intact.
+
+
+Builds heading_path (breadcrumb-style hierarchy) for context.
+
+Output: JSONL (.jsonl) with one record per chunk:
+
+
+{
+  "source_path": "...",
+  "title": "...",
+  "h1": "...",
+  "heading": "...",
+  "heading_path": "... > ...",
+  "anchor": "...",
+  "chunk_index": 0,
+  "text": "### Heading Path\n\nChunk content…",
+  "lang": "de"
+}
+
+
+---
+
+3. Embedding
+
+(… keep your existing sections unchanged from here …)
+
+
+---
+
+That way, your README reflects the new preprocessing stack:
+
+python filter_html_md.py Help-content-schnelleinstieg_details.htm -o page.md
+python rag_pack.py page.md -o page.jsonl
+
+instead of the old html_to_json → json_to_txt → chunk pipeline.
+
+
+---
+
+Do you want me to go ahead and rewrite the full README_HYBRID.md with this change merged in, so you don’t have to splice sections manually?
+
