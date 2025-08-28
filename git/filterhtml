@@ -1,0 +1,269 @@
+# src/steps/filter_html_step.py
+from __future__ import annotations
+
+"""
+FilterHtmlToTextStep
+--------------------
+Cleans raw HTML into compact, RAG-friendly plain text.
+Runs BEFORE chunking and writes .txt files into paths.txt_dir.
+
+Reads:
+  paths.html_dir (or ctx.artifacts["html_dir"])  -> *.html, *.htm, *.xhtml
+
+Writes:
+  paths.txt_dir/<basename>.txt
+
+Config it uses:
+  paths.html_dir
+  paths.txt_dir
+"""
+
+from pathlib import Path
+from typing import Iterable
+import re
+
+from bs4 import BeautifulSoup, NavigableString, Tag
+
+from src.pipeline.core import Step, Context
+from src.pipeline.utils import iter_files, fresh_dir
+from src.pipeline.utils.logging import get_logger
+
+
+# --- Heuristics / constants ---------------------------------------------------
+
+# Inline tags we allow inside "headline-ish" containers (expanded with br, img)
+INLINE_TAGS = {
+    "a","b","strong","i","em","span","code","kbd","samp","u","small",
+    "sup","sub","mark","br","img"
+}
+
+# If an <a> is followed by one of these blocks inside the same container,
+# we treat the link as a section heading.
+BLOCKY_FOLLOWS = {"div","table","ul","ol","dl","pre","section","article"}
+
+# Containers that are never content
+SKIP_CONTAINERS = {"script","style","noscript","svg","nav","header","footer","aside"}
+
+# Things that look like breadcrumbs or chrome
+BREADCRUMB_HINTS = ("sie sind hier", "zu hauptinhalt springen")
+UI_CHROME = {"logout","konto","einstellungen","placeholder","alle dateien","suche absenden","filter"}
+
+
+# --- Utilities ----------------------------------------------------------------
+
+def normalize_ws(text: str) -> str:
+    return re.sub(r"\s+", " ", text or "").strip()
+
+def only_inline_children(tag: Tag) -> bool:
+    """True if a block contains only inline tags / text (no block children)."""
+    for c in tag.children:
+        if isinstance(c, NavigableString):
+            if normalize_ws(str(c)) == "":
+                continue  # ignore pure whitespace
+            # visible text is allowed
+            continue
+        if getattr(c, "name", "").lower() not in INLINE_TAGS:
+            return False
+    return True
+
+def is_first_meaningful_child(tag: Tag) -> bool:
+    """True if tag is the first non-whitespace child of its parent."""
+    if not tag or not tag.parent:
+        return False
+    for sib in tag.parent.children:
+        if isinstance(sib, NavigableString):
+            if normalize_ws(str(sib)):
+                return False  # visible text before tag
+            continue
+        return sib is tag
+    return False
+
+def next_blocky_sibling(tag: Tag) -> bool:
+    """True if the next non-whitespace sibling is a block container (table/div/ul/…)."""
+    sib = tag.next_sibling
+    while isinstance(sib, NavigableString) and not normalize_ws(str(sib)):
+        sib = sib.next_sibling
+    if isinstance(sib, Tag):
+        return sib.name.lower() in BLOCKY_FOLLOWS
+    return False
+
+def looks_like_breadcrumb(text: str) -> bool:
+    lo = (text or "").lower()
+    return any(h in lo for h in BREADCRUMB_HINTS)
+
+def is_block_heading_anchor(a_tag: Tag) -> bool:
+    """
+    Detect headings implemented as anchors wrapped in a block:
+      - <div><a>Text</a></div>
+      - <div><span><a>Text</a></span></div>
+      - <div><a>Text</a><table>…</table></div>  (anchor heading followed by a section)
+    """
+    if not a_tag or not a_tag.get_text(strip=True):
+        return False
+
+    # If wrapped by an inline element, climb one level
+    cont = a_tag
+    if cont.parent and getattr(cont.parent, "name", "").lower() in INLINE_TAGS:
+        cont = cont.parent
+
+    parent = cont.parent
+    if not parent or getattr(parent, "name", "").lower() not in {"div","td","th"}:
+        return False
+
+    link_txt = normalize_ws(a_tag.get_text(" ", strip=True))
+    if not link_txt or looks_like_breadcrumb(link_txt) or link_txt.lower() in UI_CHROME:
+        return False
+
+    parent_txt = normalize_ws(parent.get_text(" ", strip=True))
+
+    # Case 1: container text is exactly the link text, and container has only inline children
+    if parent_txt == link_txt and only_inline_children(parent):
+        return True
+
+    # Case 2: the anchor is the first meaningful child and a block immediately follows
+    if is_first_meaningful_child(cont if cont is not a_tag else a_tag) and next_blocky_sibling(cont if cont is not a_tag else a_tag):
+        return True
+
+    return False
+
+
+# --- Filter core --------------------------------------------------------------
+
+def filter_html_string(html: str) -> str:
+    """Return a compact plain-text representation of an HTML page."""
+    soup = BeautifulSoup(html, "html.parser")
+
+    # Remove obvious non-content containers to reduce noise
+    for tag in soup.find_all(list(SKIP_CONTAINERS)):
+        tag.decompose()
+
+    title = soup.title.get_text(strip=True) if soup.title else ""
+
+    h1 = soup.find("h1")
+    h1_text = normalize_ws(h1.get_text(" ", strip=True)) if h1 else ""
+
+    # pick traversal root
+    root = h1 if h1 else (soup.body or soup)
+    iterable = root.find_all_next(True) if h1 else root.find_all(True)
+
+    lines = []
+
+    # If no <h1>, try to grab a heading immediately before first <pre>
+    if not h1:
+        pre = soup.find("pre")
+        if pre:
+            for prev in pre.find_all_previous():
+                if prev.name in ("h2","h3","h4","h5","h6","div","td","th","p","b","strong","span","a"):
+                    t = normalize_ws(prev.get_text(" ", strip=True))
+                    if t and not looks_like_breadcrumb(t) and t.lower() not in UI_CHROME:
+                        lines.append(t)
+                        break
+
+    for el in iterable:
+        name = (el.name or "").lower()
+
+        # Skip obvious crumbs/utility bars
+        if name in {"span","div"}:
+            tpeek = normalize_ws(el.get_text(" ", strip=True))
+            if looks_like_breadcrumb(tpeek) or tpeek.lower() in UI_CHROME:
+                continue
+
+        # Headings h1..h6
+        if name in ("h1","h2","h3","h4","h5","h6"):
+            txt = normalize_ws(el.get_text(" ", strip=True))
+
+        # Block-level anchor headings
+        elif name == "a" and is_block_heading_anchor(el):
+            txt = normalize_ws(el.get_text(" ", strip=True))
+
+        # Headline-ish DIVs that contain only inline nodes (no nested blocks)
+        elif name == "div" and only_inline_children(el):
+            txt = normalize_ws(el.get_text(" ", strip=True))
+            if not txt or looks_like_breadcrumb(txt) or txt.lower() in UI_CHROME:
+                continue
+
+        # Table cells that *act* like headings
+        elif name in ("th","td"):
+            raw = normalize_ws(el.get_text(" ", strip=True))
+            if not raw:
+                continue
+            if name == "th" or el.find(["b","strong"]):
+                txt = raw
+            else:
+                continue
+
+        # Standalone bold/strong blocks (not inside paragraphs/lis)
+        elif name in ("b","strong"):
+            if el.find_parent(["p","li"]):
+                continue
+            txt = normalize_ws(el.get_text(" ", strip=True))
+
+        # Regular content
+        elif name in ("p","li"):
+            txt = normalize_ws(el.get_text(" ", strip=True))
+
+        # Preserve formatted blocks
+        elif name == "pre":
+            txt = el.get_text()  # keep line breaks/spaces
+
+        else:
+            continue
+
+        if txt and (not lines or lines[-1] != txt):
+            lines.append(txt)
+
+    # assemble output
+    out = []
+    if title:
+        out.append(f"title:{title}")
+    if h1_text:
+        out.append(h1_text)
+    if lines:
+        out.append("")
+        out.extend(lines)
+
+    return "\n".join(out)
+
+
+# --- Pipeline step ------------------------------------------------------------
+
+class FilterHtmlToTextStep(Step):
+    """Convert raw HTML pages to plain text files consumed by the chunker."""
+    name = "FilterHTML"
+
+    def run(self, ctx: Context) -> None:
+        log = get_logger(self.name)
+
+        # ---- Paths
+        html_root = Path(ctx.artifacts.get("html_dir") or ctx.cfg["paths"]["html_dir"])
+        out_dir = fresh_dir(ctx.cfg["paths"]["txt_dir"])
+
+        if not html_root.exists():
+            log.error("Input HTML directory does not exist: %s", html_root)
+            return
+
+        # ---- Process
+        count_in = 0
+        count_out = 0
+        exts = [".html", ".htm", ".xhtml"]
+        for p in iter_files(html_root, exts=exts):
+            count_in += 1
+            try:
+                html = p.read_text(encoding="utf-8", errors="ignore")
+            except Exception as e:
+                log.warning("Failed to read %s: %s", p, e)
+                continue
+
+            txt = filter_html_string(html).strip()
+            if not txt:
+                continue
+
+            out_path = out_dir / (p.stem + ".txt")
+            try:
+                out_path.write_text(txt + "\n", encoding="utf-8")
+                count_out += 1
+            except Exception as e:
+                log.warning("Failed to write %s: %s", out_path, e)
+
+        log.info("Filtered HTML → %s (files in: %d, txt written: %d)", out_dir, count_in, count_out)
+        ctx.artifacts["txt_dir"] = str(out_dir)
